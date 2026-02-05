@@ -1,1 +1,15 @@
+services:
+  iris-blue:
+    image: iris-api:${IMAGE_TAG}
+    container_name: iris-blue
+    ports:
+      - "8082:8000"
+    restart: unless-stopped
+    networks:
+      - iris-net
+
+networks:
+  iris-net:
+    external: true
+    name: iris-net
 
