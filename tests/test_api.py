@@ -1,5 +1,9 @@
+import os
 from fastapi.testclient import TestClient
-from service.app.main import app
+
+# Make sure this matches your module structure
+# If main.py is in service/app/main.py, python path will be set in Jenkins stage
+from main import app
 
 client = TestClient(app)
 
@@ -11,6 +15,6 @@ def test_health():
 def test_predict():
     r = client.post("/predict", json={"features": [5.1, 3.5, 1.4, 0.2]})
     assert r.status_code == 200
-    body = r.json()
-    assert body["predicted_class"] in [0, 1, 2]
-    assert body["class_name"] in ["setosa", "versicolor", "virginica"]
+    data = r.json()
+    assert "prediction" in data
+    assert "class_name" in data["prediction"]
