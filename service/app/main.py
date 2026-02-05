@@ -1,48 +1,56 @@
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+import os
 from typing import List
+
 import joblib
 import numpy as np
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 
-APP_TITLE = "Iris Model API"
-MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/model.joblib")
+MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/iris_model.joblib")
 
-app = FastAPI(title=APP_TITLE)
+bundle = joblib.load(MODEL_PATH)
+model = bundle["model"]
+target_names = bundle["target_names"]
+
+app = FastAPI(title="Iris ML API", version="1.0.0")
+
 
 class PredictRequest(BaseModel):
-    # Iris features in the canonical order:
-    # sepal length, sepal width, petal length, petal width
-    features: List[List[float]] = Field(
+    features: List[float] = Field(
         ...,
-        examples=[[[5.1, 3.5, 1.4, 0.2], [6.2, 3.4, 5.4, 2.3]]]
+        min_length=4,
+        max_length=4,
+        examples=[[5.1, 3.5, 1.4, 0.2]],
     )
 
-class PredictResponse(BaseModel):
-    predictions: List[int]
-    probabilities: List[List[float]]
 
-model = None
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs", status_code=307)
 
-@app.on_event("startup")
-def load_model():
-    global model
-    model = joblib.load(MODEL_PATH)
 
 @app.get("/health")
 def health():
-    ok = model is not None
-    return {"status": "ok" if ok else "not_ready", "model_path": MODEL_PATH}
+    return {"status": "ok"}
 
-@app.post("/predict", response_model=PredictResponse)
+
+@app.post("/predict")
 def predict(req: PredictRequest):
-    X = np.array(req.features, dtype=float)
-    preds = model.predict(X).tolist()
+    if len(req.features) != 4:
+        raise HTTPException(status_code=400, detail="features must have exactly 4 values")
 
-    # If classifier supports predict_proba
-    if hasattr(model, "predict_proba"):
-        probs = model.predict_proba(X).tolist()
-    else:
-        probs = [[None] for _ in preds]
+    x = np.array([req.features], dtype=float)
+    proba = model.predict_proba(x)[0]
+    idx = int(np.argmax(proba))
 
-    return {"predictions": preds, "probabilities": probs}
+    return {
+        "input": req.features,
+        "prediction": {
+            "class_index": idx,
+            "class_name": target_names[idx],
+            "probabilities": proba.tolist(),
+        },
+    }
