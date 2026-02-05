@@ -1,0 +1,15 @@
+upstream iris_upstream {
+    server iris-blue:8000;
+}
+
+server {
+    listen 80;
+
+    location /health {
+        proxy_pass http://iris_upstream/health;
+    }
+
+    location /predict {
+        proxy_pass http://iris_upstream/predict;
+    }
+}
