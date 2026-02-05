@@ -3,13 +3,18 @@ pipeline {
 
   options {
     timestamps()
+    disableConcurrentBuilds()
   }
 
   environment {
-    IMAGE_NAME = "iris-api"
-    PROXY_URL  = "http://127.0.0.1:8081"
-    BLUE_URL   = "http://127.0.0.1:8082"
-    GREEN_URL  = "http://127.0.0.1:8083"
+    // Tag images per build so you can roll back if needed
+    IRIS_IMAGE_TAG = "${env.BUILD_NUMBER}"
+
+    // Local venv path in workspace
+    VENV_DIR = ".venv"
+
+    // Nginx entrypoint
+    BASE_URL = "http://127.0.0.1:8081"
   }
 
   stages {
@@ -20,140 +25,131 @@ pipeline {
       }
     }
 
-    stage('Checkout') {
-      steps {
-        script {
-          bat 'git rev-parse --short HEAD > .gitshort'
-          env.GIT_SHORT = readFile('.gitshort').trim()
-          echo "Commit: ${env.GIT_SHORT}"
-        }
-      }
-    }
-
     stage('Setup Python + Install') {
       steps {
-        bat '''
-          py -3.11 -m venv .venv
-          .venv\\Scripts\\python -m pip install --upgrade pip
-          .venv\\Scripts\\pip install -r service\\requirements.txt
-          .venv\\Scripts\\pip install -r service\\requirements-dev.txt
+        powershell '''
+          $ErrorActionPreference = "Stop"
+
+          python --version
+
+          if (Test-Path $env:VENV_DIR) {
+            Remove-Item -Recurse -Force $env:VENV_DIR
+          }
+
+          python -m venv $env:VENV_DIR
+
+          .\\$env:VENV_DIR\\Scripts\\python -m pip install --upgrade pip
+          .\\$env:VENV_DIR\\Scripts\\pip install -r requirements.txt
         '''
       }
     }
 
     stage('Train Model Artifact') {
       steps {
-        bat '''
-          .venv\\Scripts\\python service\\train.py
-          dir artifacts
+        powershell '''
+          $ErrorActionPreference = "Stop"
+
+          if (!(Test-Path "artifacts")) {
+            New-Item -ItemType Directory -Path "artifacts" | Out-Null
+          }
+
+          # Change this command to your actual training entrypoint
+          .\\$env:VENV_DIR\\Scripts\\python service\\train_local.py
+
+          if (!(Test-Path "artifacts\\iris_model.joblib")) {
+            throw "Model artifact not found at artifacts\\iris_model.joblib"
+          }
+
+          Write-Output "Model artifact created: artifacts\\iris_model.joblib"
         '''
-        archiveArtifacts artifacts: 'artifacts/**', fingerprint: true
       }
     }
 
     stage('Unit + API Tests') {
       steps {
-        bat '''
-          set PYTHONPATH=service\\app
-          .venv\\Scripts\\pytest -q
+        powershell '''
+          $ErrorActionPreference = "Stop"
+
+          # If you have pytest tests
+          if (Test-Path "tests") {
+            .\\$env:VENV_DIR\\Scripts\\pytest -q
+          } else {
+            Write-Output "No tests folder found, skipping pytest."
+          }
+
+          # Optional quick import check
+          .\\$env:VENV_DIR\\Scripts\\python -c "import fastapi; print('FastAPI import OK')"
         '''
       }
     }
 
     stage('Build Docker Image') {
       steps {
-        bat """
-          docker build -t %IMAGE_NAME%:%GIT_SHORT% -f service\\Dockerfile .
-          docker image ls %IMAGE_NAME% --format "table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}"
-        """
+        powershell '''
+          $ErrorActionPreference = "Stop"
+
+          Write-Output "Building with tag: $env:IRIS_IMAGE_TAG"
+
+          # Compose will use IRIS_IMAGE_TAG in docker-compose.yml if you added it
+          docker compose build
+        '''
       }
     }
 
     stage('Deploy Blue-Green') {
       steps {
-        script {
-          def active = "blue"
-          if (fileExists("deploy/active_color.txt")) {
-            active = readFile("deploy/active_color.txt").trim()
-          }
-          def newColor = (active == "blue") ? "green" : "blue"
-          env.ACTIVE_COLOR = active
-          env.NEW_COLOR = newColor
-          echo "Active: ${env.ACTIVE_COLOR}, New: ${env.NEW_COLOR}"
-        }
+        powershell '''
+          $ErrorActionPreference = "Stop"
 
-        bat '''
-          docker network inspect iris-net >nul 2>nul || docker network create iris-net
-          docker compose -f deploy\\docker-compose.proxy.yml up -d
+          # Ensure compose sees the env var for image tag
+          $env:IRIS_IMAGE_TAG = "$env:IRIS_IMAGE_TAG"
+
+          # Your requirement: deploy via down + up
+          .\\deploy\\deploy_stack.ps1
         '''
-
-        bat """
-          set IMAGE_TAG=%GIT_SHORT% && docker compose -f deploy\\docker-compose.${env.NEW_COLOR}.yml up -d
-        """
-
-        bat 'docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"'
       }
     }
 
     stage('Smoke Test') {
       steps {
-        script {
-          def url = (env.NEW_COLOR == "blue") ? env.BLUE_URL : env.GREEN_URL
-          env.NEW_URL = url
-          echo "Smoke testing ${env.NEW_COLOR} at ${env.NEW_URL}"
-        }
-
-        bat """
-          curl.exe -s -o nul -w "health=%{http_code}\\n" %NEW_URL%/health
-          curl.exe -s -o nul -w "docs=%{http_code}\\n" %NEW_URL%/docs
-          curl.exe -s -X POST %NEW_URL%/predict -H "Content-Type: application/json" --data-binary "{\\"features\\":[5.1,3.5,1.4,0.2]}"
-        """
+        powershell '''
+          $ErrorActionPreference = "Stop"
+          .\\deploy\\smoke_test.ps1 -BaseUrl "$env:BASE_URL"
+        '''
       }
     }
 
     stage('Switch To Green') {
       steps {
-        bat """
-          powershell -ExecutionPolicy Bypass -File deploy\\switch_traffic.ps1 -Color ${env.NEW_COLOR}
-        """
+        powershell '''
+          $ErrorActionPreference = "Stop"
 
-        bat """
-          echo ${env.NEW_COLOR} > deploy\\active_color.txt
-        """
+          .\\deploy\\switch_to_green.ps1
 
-        bat """
-          curl.exe -s -o nul -w "proxy_health=%{http_code}\\n" %PROXY_URL%/health
-          curl.exe -s -o nul -w "proxy_docs=%{http_code}\\n" %PROXY_URL%/docs
-        """
-
-        script {
-          def oldColor = env.ACTIVE_COLOR
-          echo "Cleaning up old color: ${oldColor}"
-          env.OLD_COLOR = oldColor
-        }
-
-        bat """
-          docker compose -f deploy\\docker-compose.${env.OLD_COLOR}.yml down
-        """
+          # Verify again after switching traffic
+          .\\deploy\\smoke_test.ps1 -BaseUrl "$env:BASE_URL"
+        '''
       }
     }
   }
 
   post {
+    always {
+      powershell '''
+        Write-Output "Docker compose status:"
+        docker compose ps
+      '''
+      archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true
+    }
+
     failure {
-      echo "Pipeline failed, leaving current production traffic as-is."
-
-      script {
-        if (env.NEW_COLOR != null) {
-          echo "Attempting cleanup of NEW_COLOR=${env.NEW_COLOR}"
+      // Optional: auto rollback to blue if green switch fails
+      powershell '''
+        if (Test-Path ".\\deploy\\switch_to_blue.ps1") {
+          Write-Output "Rolling back to BLUE..."
+          .\\deploy\\switch_to_blue.ps1
         }
-      }
-
-      bat """
-        if exist deploy\\docker-compose.${env.NEW_COLOR}.yml (
-          docker compose -f deploy\\docker-compose.${env.NEW_COLOR}.yml down
-        )
-      """
+      '''
     }
   }
 }
